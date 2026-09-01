@@ -1,7 +1,7 @@
 ---
-title: "实验 12：在 HAMi 上使用 KitOps ModelKit 提供模型服务"
+title: "实验 15：在 HAMi 上使用 KitOps ModelKit 提供模型服务"
 description: "将模型打包为 KitOps ModelKit，通过 initContainer 从 Jozu Hub 拉取，并使用 SGLang（可选 vLLM）在 HAMi GPU 共享资源上从本地提供服务。"
-sidebar_label: "实验 12：KitOps ModelKit 推理"
+sidebar_label: "实验 15：KitOps ModelKit 推理"
 lab:
   level: Advanced
   duration: 约 60 分钟
@@ -21,7 +21,7 @@ toc_max_heading_level: 2
 
 本实验演示如何将模型打包为 **[KitOps](https://kitops.org/) ModelKit**（一种带版本的 OCI 制品），使用 KitOps `initContainer` 从 OCI 注册表（示例中使用 **[Jozu Hub](https://jozu.ml)**）下载到 Pod，然后通过 [SGLang](https://github.com/sgl-project/sglang)（主要示例）或 vLLM（可选的共置示例）从**本地目录**在 HAMi 虚拟化 GPU 共享资源上提供服务。
 
-与[实验 6（vLLM）](./hami-vllm)和实验 11（SGLang）一样，推理引擎运行在 HAMi 资源上。本实验采用注册表原生的**模型供应链**：模型被打包为 ModelKit，在 Jozu Hub 上进行版本管理和存储，以 OCI 制品的形式拉取到 Pod，并从本地路径提供服务。
+与[实验 6（vLLM）](./hami-vllm)一样，推理引擎运行在 HAMi 资源上。本实验采用注册表原生的**模型供应链**：模型被打包为 ModelKit，在 Jozu Hub 上进行版本管理和存储，以 OCI 制品的形式拉取到 Pod，并从本地路径提供服务。
 
 ## 学习目标
 
@@ -69,16 +69,16 @@ flowchart TB
 
 ## 前置条件
 
-- 实验 11（或实验 6）的全部前置条件：配备 NVIDIA GPU 的 Kubernetes 集群、正常运行的 HAMi，以及 `kubectl` 和 `helm`
+- 配备 NVIDIA GPU 的 Kubernetes 集群、正常运行的 HAMi，以及 `kubectl` 和 `helm`（完整设置请参阅[实验 6](./hami-vllm)）
 - Docker（或等效的构建工具），用于构建镜像并将其加载到集群
 - 工作站上的 [`kit`](https://github.com/jozu-ai/kitops) CLI（可选，但建议用于 `kit inspect`）
 - 能够从公共注册表 `jozu.ml` 拉取制品（示例 ModelKit 无需登录）
 
-本实验假设已经按照实验 11 安装 HAMi。若尚未安装，请先完成实验 11 的步骤 1 至 3。
+本实验假设已经安装 HAMi。若尚未安装，请先完成[实验 6](./hami-vllm)的步骤 1 至 3。
 
 ## 示例集群状态
 
-验证使用与实验 11 相同的 kind + H100 集群。HAMi 公布 10 个 vGPU，`hami-scheduler` 和 `hami-device-plugin` 均处于 Running 状态。
+验证使用 kind + H100 集群。HAMi 公布 10 个 vGPU，`hami-scheduler` 和 `hami-device-plugin` 均处于 Running 状态。
 
 本实验使用以下公共 ModelKit：
 
@@ -146,8 +146,10 @@ ARG KITOPS_VERSION=v1.11.0
 
 RUN apk add --no-cache bash coreutils findutils ca-certificates curl tar \
     && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/kitops-linux-x86_64.tar.gz" -o /tmp/kit.tgz \
+    && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/kitops_${KITOPS_VERSION}_checksums.txt" -o /tmp/kit-checksums.txt \
+    && grep "  kitops-linux-x86_64.tar.gz$" /tmp/kit-checksums.txt | sed 's#kitops-linux-x86_64.tar.gz#/tmp/kit.tgz#' | sha256sum -c - \
     && tar -xzf /tmp/kit.tgz -C /usr/local/bin kit \
-    && rm -f /tmp/kit.tgz \
+    && rm -f /tmp/kit.tgz /tmp/kit-checksums.txt \
     && kit version
 
 ENV MODELKIT_REF="jozu.ml/jonathangamer202002/qwen3-4b-instruct@sha256:df4629f6a10bba7bec45e12bd15f910ed1024699bfbb44b63240899f71bb1c19" \
@@ -180,12 +182,22 @@ UNPACK_PATH="${UNPACK_PATH:-/models}"
 MODEL_SUBDIR="${MODEL_SUBDIR:-qwen3}"
 DEST="${UNPACK_PATH}/${MODEL_SUBDIR}"
 RAW="${UNPACK_PATH}/.raw-${MODEL_SUBDIR}"
+STAGE="${UNPACK_PATH}/.stage-${MODEL_SUBDIR}-$$"
 LOCK="${UNPACK_PATH}/.lock-${MODEL_SUBDIR}"
+MARKER=".modelkit-ref"
 
 # keep the kit pull cache on the (large) mounted volume, not the tiny rootfs
 export KITOPS_HOME="${UNPACK_PATH}/.kitcache"
 
-ready() { [ -f "${DEST}/config.json" ] && ls "${DEST}"/*.safetensors >/dev/null 2>&1; }
+valid_model() {
+  [ -f "$1/config.json" ] && ls "$1"/*.safetensors >/dev/null 2>&1
+}
+
+ready() {
+  valid_model "${DEST}" &&
+    [ -f "${DEST}/${MARKER}" ] &&
+    [ "$(cat "${DEST}/${MARKER}")" = "${MODELKIT_REF}" ]
+}
 
 echo "[kitunpacker] ref=${MODELKIT_REF} -> ${DEST}"
 
@@ -207,8 +219,16 @@ if ! mkdir "${LOCK}" 2>/dev/null; then
   echo "[kitunpacker] timed out waiting for peer unpack" >&2
   exit 1
 fi
-# shellcheck disable=SC2064
-trap "rmdir '${LOCK}' 2>/dev/null || true" EXIT INT TERM
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf "${RAW}" "${STAGE}" "${KITOPS_HOME}"
+  rmdir "${LOCK}" 2>/dev/null || true
+  exit "${status}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # optional login for private registries (public Jozu Hub needs none)
 if [ -n "${REGISTRY_URL:-}" ] && [ -n "${USERNAME:-}" ] && [ -n "${PASSWORD:-}" ]; then
@@ -216,28 +236,33 @@ if [ -n "${REGISTRY_URL:-}" ] && [ -n "${USERNAME:-}" ] && [ -n "${PASSWORD:-}" 
   echo "${PASSWORD}" | kit login "${REGISTRY_URL}" -u "${USERNAME}" --password-stdin
 fi
 
-rm -rf "${RAW}"; mkdir -p "${RAW}"
+rm -rf "${RAW}" "${STAGE}"; mkdir -p "${RAW}" "${STAGE}"
 echo "[kitunpacker] pulling + unpacking model layers from registry..."
 kit unpack --filter model "${MODELKIT_REF}" -d "${RAW}"
 
 # Flatten: ModelKits may store the .safetensors shards in a model/ subdir while
 # config.json / *.index.json / tokenizer sit one level up. vLLM/transformers
-# need them all in one directory, so collect everything into DEST.
+# need them all in one directory, so collect everything into a staging directory.
 SRC_CFG="$(find "${RAW}" -name config.json | head -1)"
 [ -n "${SRC_CFG}" ] || { echo "[kitunpacker] config.json not found after unpack" >&2; exit 1; }
 SRC="$(dirname "${SRC_CFG}")"
 
-mkdir -p "${DEST}"
 # all weight shards, wherever they live under the unpacked tree
-find "${SRC}" -name '*.safetensors' -exec mv -f {} "${DEST}/" \;
+find "${SRC}" -name '*.safetensors' -exec mv -f {} "${STAGE}/" \;
 # all top-level metadata files (config, index, tokenizer, vocab, generation cfg)
-find "${SRC}" -maxdepth 1 -type f -exec mv -f {} "${DEST}/" \;
+find "${SRC}" -maxdepth 1 -type f -exec mv -f {} "${STAGE}/" \;
 
-rm -rf "${RAW}" "${KITOPS_HOME}"
+valid_model "${STAGE}" || { echo "[kitunpacker] validation failed: missing config or shards" >&2; exit 1; }
+printf '%s\n' "${MODELKIT_REF}" >"${STAGE}/${MARKER}"
+
+# Rename only a fully validated tree into place. Readers never observe a
+# partially populated DEST, and a stale DEST for another reference is replaced.
+rm -rf "${DEST}"
+mv "${STAGE}" "${DEST}"
 
 echo "[kitunpacker] final model directory:"
 ls -la "${DEST}"
-ready || { echo "[kitunpacker] validation failed: missing config or shards" >&2; exit 1; }
+ready || { echo "[kitunpacker] publication validation failed" >&2; exit 1; }
 echo "[kitunpacker] done."
 
 ```
@@ -727,7 +752,6 @@ package:
   description: >
     Qwen3-4B-Instruct-2507 packaged as a KitOps ModelKit (safetensors layout), served on HAMi-virtualized GPUs by vLLM and SGLang.
 
-
 model:
   name: qwen3-4b-instruct
   path: ./qwen3
@@ -753,7 +777,7 @@ kit push jozu.ml/<your-org>/qwen3-4b-instruct:latest
 | 自定义镜像出现 ImagePullBackOff | 使用 `kind load` 或推送到你的注册表。本地标签请设置 `imagePullPolicy: IfNotPresent`。 |
 | GPU Pod 处于 Pending 状态 | 释放 HAMi 共享资源、降低 `gpumem`，并检查 `hami-scheduler` 事件。 |
 | 私有注册表返回 401 | 在 `kitops-init` 上设置 `REGISTRY_URL`、`USERNAME` 和 `PASSWORD`。 |
-| Pod 内仍显示完整 GPU 显存 | 与实验 11 相同，请检查 HAMi 环境变量和 `schedulerName`。 |
+| Pod 内仍显示完整 GPU 显存 | 检查 HAMi 环境变量和 `schedulerName`。 |
 
 ## 清理
 
@@ -778,4 +802,4 @@ kubectl delete namespace kitops --ignore-not-found
 - 将公共 Jozu ModelKit 换成内部注册表中的 ModelKit，并配置 imagePullSecrets 或 `kit login` Secret。
 - 在 SGLang 和 vLLM 之间共享一个 PVC，使 ModelKit 只需解包一次。
 - 结合[实验 3：GPU 切分](./gpu-partitioning)，在每个 GPU 上容纳更多租户。
-- 返回实验 11：SGLang，了解引擎在启动时直接拉取模型的简化方式。该方式适合在不涉及供应链的情况下独立调试推理引擎。
+- 若要采用更简单的调试路径，请先让 SGLang 在启动时直接拉取模型，再添加 ModelKit 供应链工作流。

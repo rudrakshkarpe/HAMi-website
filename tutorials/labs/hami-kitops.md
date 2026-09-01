@@ -1,7 +1,7 @@
 ---
-title: "Lab 12: Serve Models from a KitOps ModelKit on HAMi"
+title: "Lab 15: Serve Models from a KitOps ModelKit on HAMi"
 description: "Package a model as a KitOps ModelKit, pull it from Jozu Hub with an initContainer, and serve it locally with SGLang (and optionally vLLM) on HAMi GPU shares."
-sidebar_label: "Lab 12: KitOps ModelKit Inference"
+sidebar_label: "Lab 15: KitOps ModelKit Inference"
 lab:
   level: Advanced
   duration: about 60 minutes
@@ -21,7 +21,7 @@ toc_max_heading_level: 2
 
 This lab demonstrates how to package a model as a **[KitOps](https://kitops.org/) ModelKit**, a versioned OCI artifact, and download it from an OCI registry (**[Jozu Hub](https://jozu.ml)** in the examples) into the Pod using a KitOps `initContainer`, then serve it from a **local directory** with [SGLang](https://github.com/sgl-project/sglang) (primary) or vLLM (optional co-resident example) on HAMi-virtualized GPU shares.
 
-Like [Lab 6 (vLLM)](./hami-vllm) and Lab 11 (SGLang), the inference engines run on HAMi resources. Here the **model supply chain** is registry-native: the model is packaged as a ModelKit, versioned and stored on Jozu Hub, pulled into the Pod as an OCI artifact, and served from a local path.
+Like [Lab 6 (vLLM)](./hami-vllm), the inference engines run on HAMi resources. Here the **model supply chain** is registry-native: the model is packaged as a ModelKit, versioned and stored on Jozu Hub, pulled into the Pod as an OCI artifact, and served from a local path.
 
 ## Learning Objectives
 
@@ -69,16 +69,16 @@ flowchart TB
 
 ## Prerequisites
 
-- Everything from Lab 11 (or Lab 6): a Kubernetes cluster with NVIDIA GPUs, HAMi installed and healthy, `kubectl`, `helm`
+- A Kubernetes cluster with NVIDIA GPUs, HAMi installed and healthy, `kubectl`, and `helm` (see [Lab 6](./hami-vllm) for a complete setup)
 - Docker (or an equivalent builder) to build and load images into the cluster
 - [`kit`](https://github.com/jozu-ai/kitops) CLI on your workstation (optional but recommended for `kit inspect`)
 - Ability to pull from the public registry `jozu.ml` (no login required for the sample ModelKit)
 
-This lab assumes HAMi is already installed as in Lab 11. If not, complete Lab 11 Steps 1–3 first.
+This lab assumes HAMi is already installed. If not, complete Steps 1–3 of [Lab 6](./hami-vllm) first.
 
 ## Example Cluster State
 
-Verification used the same kind + H100 cluster as Lab 11, with HAMi advertising 10 vGPUs and both `hami-scheduler` / `hami-device-plugin` Running.
+Verification used a kind + H100 cluster with HAMi advertising 10 vGPUs and both `hami-scheduler` / `hami-device-plugin` Running.
 
 Public ModelKit used throughout:
 
@@ -146,8 +146,10 @@ ARG KITOPS_VERSION=v1.11.0
 
 RUN apk add --no-cache bash coreutils findutils ca-certificates curl tar \
     && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/kitops-linux-x86_64.tar.gz" -o /tmp/kit.tgz \
+    && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/kitops_${KITOPS_VERSION}_checksums.txt" -o /tmp/kit-checksums.txt \
+    && grep "  kitops-linux-x86_64.tar.gz$" /tmp/kit-checksums.txt | sed 's#kitops-linux-x86_64.tar.gz#/tmp/kit.tgz#' | sha256sum -c - \
     && tar -xzf /tmp/kit.tgz -C /usr/local/bin kit \
-    && rm -f /tmp/kit.tgz \
+    && rm -f /tmp/kit.tgz /tmp/kit-checksums.txt \
     && kit version
 
 ENV MODELKIT_REF="jozu.ml/jonathangamer202002/qwen3-4b-instruct@sha256:df4629f6a10bba7bec45e12bd15f910ed1024699bfbb44b63240899f71bb1c19" \
@@ -180,12 +182,22 @@ UNPACK_PATH="${UNPACK_PATH:-/models}"
 MODEL_SUBDIR="${MODEL_SUBDIR:-qwen3}"
 DEST="${UNPACK_PATH}/${MODEL_SUBDIR}"
 RAW="${UNPACK_PATH}/.raw-${MODEL_SUBDIR}"
+STAGE="${UNPACK_PATH}/.stage-${MODEL_SUBDIR}-$$"
 LOCK="${UNPACK_PATH}/.lock-${MODEL_SUBDIR}"
+MARKER=".modelkit-ref"
 
 # keep the kit pull cache on the (large) mounted volume, not the tiny rootfs
 export KITOPS_HOME="${UNPACK_PATH}/.kitcache"
 
-ready() { [ -f "${DEST}/config.json" ] && ls "${DEST}"/*.safetensors >/dev/null 2>&1; }
+valid_model() {
+  [ -f "$1/config.json" ] && ls "$1"/*.safetensors >/dev/null 2>&1
+}
+
+ready() {
+  valid_model "${DEST}" &&
+    [ -f "${DEST}/${MARKER}" ] &&
+    [ "$(cat "${DEST}/${MARKER}")" = "${MODELKIT_REF}" ]
+}
 
 echo "[kitunpacker] ref=${MODELKIT_REF} -> ${DEST}"
 
@@ -207,8 +219,16 @@ if ! mkdir "${LOCK}" 2>/dev/null; then
   echo "[kitunpacker] timed out waiting for peer unpack" >&2
   exit 1
 fi
-# shellcheck disable=SC2064
-trap "rmdir '${LOCK}' 2>/dev/null || true" EXIT INT TERM
+cleanup() {
+  status=$?
+  trap - EXIT
+  rm -rf "${RAW}" "${STAGE}" "${KITOPS_HOME}"
+  rmdir "${LOCK}" 2>/dev/null || true
+  exit "${status}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # optional login for private registries (public Jozu Hub needs none)
 if [ -n "${REGISTRY_URL:-}" ] && [ -n "${USERNAME:-}" ] && [ -n "${PASSWORD:-}" ]; then
@@ -216,28 +236,33 @@ if [ -n "${REGISTRY_URL:-}" ] && [ -n "${USERNAME:-}" ] && [ -n "${PASSWORD:-}" 
   echo "${PASSWORD}" | kit login "${REGISTRY_URL}" -u "${USERNAME}" --password-stdin
 fi
 
-rm -rf "${RAW}"; mkdir -p "${RAW}"
+rm -rf "${RAW}" "${STAGE}"; mkdir -p "${RAW}" "${STAGE}"
 echo "[kitunpacker] pulling + unpacking model layers from registry..."
 kit unpack --filter model "${MODELKIT_REF}" -d "${RAW}"
 
 # Flatten: ModelKits may store the .safetensors shards in a model/ subdir while
 # config.json / *.index.json / tokenizer sit one level up. vLLM/transformers
-# need them all in one directory, so collect everything into DEST.
+# need them all in one directory, so collect everything into a staging directory.
 SRC_CFG="$(find "${RAW}" -name config.json | head -1)"
 [ -n "${SRC_CFG}" ] || { echo "[kitunpacker] config.json not found after unpack" >&2; exit 1; }
 SRC="$(dirname "${SRC_CFG}")"
 
-mkdir -p "${DEST}"
 # all weight shards, wherever they live under the unpacked tree
-find "${SRC}" -name '*.safetensors' -exec mv -f {} "${DEST}/" \;
+find "${SRC}" -name '*.safetensors' -exec mv -f {} "${STAGE}/" \;
 # all top-level metadata files (config, index, tokenizer, vocab, generation cfg)
-find "${SRC}" -maxdepth 1 -type f -exec mv -f {} "${DEST}/" \;
+find "${SRC}" -maxdepth 1 -type f -exec mv -f {} "${STAGE}/" \;
 
-rm -rf "${RAW}" "${KITOPS_HOME}"
+valid_model "${STAGE}" || { echo "[kitunpacker] validation failed: missing config or shards" >&2; exit 1; }
+printf '%s\n' "${MODELKIT_REF}" >"${STAGE}/${MARKER}"
+
+# Rename only a fully validated tree into place. Readers never observe a
+# partially populated DEST, and a stale DEST for another reference is replaced.
+rm -rf "${DEST}"
+mv "${STAGE}" "${DEST}"
 
 echo "[kitunpacker] final model directory:"
 ls -la "${DEST}"
-ready || { echo "[kitunpacker] validation failed: missing config or shards" >&2; exit 1; }
+ready || { echo "[kitunpacker] publication validation failed" >&2; exit 1; }
 echo "[kitunpacker] done."
 
 ```
@@ -727,7 +752,6 @@ package:
   description: >
     Qwen3-4B-Instruct-2507 packaged as a KitOps ModelKit (safetensors layout), served on HAMi-virtualized GPUs by vLLM and SGLang.
 
-
 model:
   name: qwen3-4b-instruct
   path: ./qwen3
@@ -753,7 +777,7 @@ Then point `MODELKIT_REF` in the Deployment at your tag.
 | ImagePullBackOff for custom images | `kind load` / push to your registry; set `imagePullPolicy: IfNotPresent` for local tags. |
 | Pod Pending on GPU | Free HAMi shares; lower `gpumem`; confirm `hami-scheduler` events. |
 | Private registry 401 | Set `REGISTRY_URL` / `USERNAME` / `PASSWORD` on `kitops-init`. |
-| In-pod memory still full GPU size | Same as Lab 11 — verify HAMi env vars and `schedulerName`. |
+| In-pod memory still full GPU size | Verify the HAMi environment variables and `schedulerName`. |
 
 ## Cleanup
 
@@ -778,4 +802,4 @@ kubectl delete namespace kitops --ignore-not-found
 - Swap the public Jozu ModelKit for your internal registry ModelKit and wire imagePullSecrets / `kit login` Secrets.
 - Share one PVC across SGLang and vLLM so the ModelKit is unpacked once.
 - Combine with [Lab 3: GPU Partitioning](./gpu-partitioning) to pack more tenants per GPU.
-- Return to Lab 11: SGLang for the simpler path where the engine pulls the model directly at startup, useful for debugging engines independently of the supply chain.
+- For a simpler debugging path, run SGLang with a model pulled directly at startup before adding the ModelKit supply-chain workflow.
