@@ -1,7 +1,7 @@
 ---
-title: "Lab 11: Run SGLang on HAMi GPU Shares"
+title: "Lab 15: Run SGLang on HAMi GPU Shares"
 description: "Install HAMi on a GPU cluster and schedule SGLang inference services with GPU partitioning."
-sidebar_label: "Lab 11: SGLang Inference"
+sidebar_label: "Lab 15: SGLang Inference"
 lab:
   level: Intermediate
   duration: about 45 minutes
@@ -17,7 +17,7 @@ tags:
 toc_max_heading_level: 2
 ---
 
-This lab demonstrates how to install HAMi on a Kubernetes cluster that already has NVIDIA GPUs, and use HAMi to schedule an [SGLang](https://github.com/sgl-project/sglang) inference service. Upon completion, you will have an OpenAI-compatible model service that can be verified through `/v1/models` and `/v1/chat/completions`, with HAMi enforcing GPU memory and compute caps inside the Pod.
+This lab demonstrates how to install HAMi on a Kubernetes cluster that already has NVIDIA GPUs, and use HAMi to schedule an [SGLang](https://github.com/sgl-project/sglang) inference service. Upon completion, you will have an OpenAI-compatible model service that can be verified through `/v1/models` and `/v1/chat/completions`, with HAMi enforcing a software-based GPU memory quota and compute throttle inside the Pod.
 
 This guide is modeled after [Lab 6: Run vLLM on HAMi GPU Shares](./hami-vllm). The steps are not tied to a specific cloud vendor. As long as your Kubernetes cluster has available NVIDIA GPUs, NVIDIA drivers, and container runtime support, you can reproduce the same setup.
 
@@ -57,7 +57,7 @@ flowchart TB
       HAMI_S["hami-scheduler"]
       HAMI_D["hami-device-plugin<br/>DaemonSet"]
       POD
-      N1["GPU Node<br/>NVIDIA H100 / A10 / ..."]
+      N1["GPU Node<br/>NVIDIA H100 / L40S / ..."]
     end
 
     HAMI_S --> POD
@@ -70,7 +70,7 @@ flowchart TB
 You need to prepare in advance:
 
 - A working Kubernetes cluster
-- At least 1 NVIDIA GPU node with enough free memory for the model (this guide uses a single NVIDIA H100 80GB; an A10/L40S-class GPU also works if you keep the small model and `gpumem` values)
+- At least 1 NVIDIA GPU node with more than 25,000 MiB of usable VRAM (this guide uses a single NVIDIA H100 80GB). For an A10, lower every `nvidia.com/gpumem` request and limit below the memory reported by `nvidia-smi`.
 - `kubectl` connected to the cluster
 - `helm` 3.x
 - GPU nodes with NVIDIA drivers and NVIDIA Container Toolkit / runtime support installed
@@ -134,12 +134,32 @@ kubectl get nodes -o wide
 kubectl describe node | grep -A8 -E "Capacity:|Allocatable:" | grep -E "nvidia.com/gpu|cpu:|memory:"
 ```
 
-If the cluster already has a vendor NVIDIA device plugin installed, you may already see `nvidia.com/gpu`. After installing HAMi, `nvidia.com/gpu` becomes the number of vGPUs exposed by HAMi.
+If the cluster already has a vendor NVIDIA device plugin installed, you may already see `nvidia.com/gpu`. HAMi's device plugin registers the same resource, so the two device plugins must not run on the same GPU nodes. Keep the NVIDIA drivers, Container Toolkit, and runtime installed, but disable or remove the vendor device-plugin DaemonSet before installing HAMi.
 
-HAMi's device plugin matches `gpu=on` when managed node selectors are enabled. Label your GPU nodes:
+First identify the existing plugin. On a self-managed cluster, record and remove it as follows, substituting the discovered namespace and DaemonSet name:
 
 ```bash
-kubectl label node <gpu-node-name> gpu=on --overwrite
+kubectl get daemonsets --all-namespaces | grep -E 'nvidia.*device-plugin'
+
+VENDOR_PLUGIN_NAMESPACE=<namespace>
+VENDOR_PLUGIN_DAEMONSET=<daemonset-name>
+kubectl get daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
+  -n "${VENDOR_PLUGIN_NAMESPACE}" -o yaml >nvidia-device-plugin-backup.yaml
+kubectl delete daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
+  -n "${VENDOR_PLUGIN_NAMESPACE}"
+```
+
+> If a GPU Operator or managed Kubernetes add-on owns the DaemonSet, disable that component through its operator/add-on configuration instead; otherwise its controller may recreate the DaemonSet. Do not uninstall the host driver or NVIDIA container runtime.
+
+HAMi's device plugin matches `gpu=on` when managed node selectors are enabled. Record whether the label already existed, then label the GPU node:
+
+```bash
+GPU_NODE=<gpu-node-name>
+GPU_LABEL_BEFORE="$(kubectl get node "${GPU_NODE}" -o jsonpath='{.metadata.labels.gpu}')"
+if [ "${GPU_LABEL_BEFORE}" != "on" ]; then
+  export HAMI_LAB_ADDED_GPU_LABEL=true
+fi
+kubectl label node "${GPU_NODE}" gpu=on --overwrite
 ```
 
 On Alibaba Cloud ACK, you can also select by vendor labels, for example:
@@ -163,11 +183,6 @@ helm repo update hami-charts
 Create a values file (save as `hami-values.yaml`):
 
 ```yaml
-device:
-  nvidia:
-    driver:
-      enabled: false
-
 global:
   managedNodeSelectorEnable: true
   managedNodeSelector:
@@ -179,7 +194,8 @@ devicePlugin:
 scheduler:
   # Match your cluster Kubernetes minor version (example: kind v1.36.1).
   kubeScheduler:
-    imageTag: "v1.36.1"
+    image:
+      tag: "v1.36.1"
   leaderElect: false
 ```
 
@@ -187,10 +203,9 @@ Key configuration details:
 
 | Configuration | Description |
 | --- | --- |
-| `device.nvidia.driver.enabled: false` | Nodes already have NVIDIA drivers. |
 | `global.managedNodeSelector.gpu: "on"` | Only schedule the HAMi device plugin to GPU nodes labeled `gpu=on`. |
 | `devicePlugin.deviceSplitCount: 10` | Register each physical GPU as 10 vGPUs. |
-| `scheduler.kubeScheduler.imageTag` | Must match the cluster Kubernetes version. |
+| `scheduler.kubeScheduler.image.tag` | Must match the cluster Kubernetes version. |
 | `scheduler.leaderElect: false` | Single-replica lab scheduler; avoids extender leader-election waits. |
 
 Install HAMi:
@@ -271,7 +286,7 @@ spec:
       schedulerName: hami-scheduler
       containers:
         - name: sglang
-          image: lmsysorg/sglang:latest
+          image: lmsysorg/sglang:v0.5.7
           imagePullPolicy: IfNotPresent
           command:
             - python3
@@ -338,9 +353,10 @@ Key points:
 | --- | --- |
 | `schedulerName: hami-scheduler` | Explicitly delegate scheduling to HAMi. |
 | `nvidia.com/gpu: "1"` | Request 1 HAMi GPU device share. |
-| `nvidia.com/gpumem: "25000"` | Hard GPU memory cap in MiB visible inside the container. |
-| `nvidia.com/gpucores: "30"` | Cap SM/compute usage to 30%. |
+| `nvidia.com/gpumem: "25000"` | Software-enforced CUDA memory quota in MiB, also reported through intercepted NVML calls. |
+| `nvidia.com/gpucores: "30"` | Apply a software compute throttle targeting 30% SM usage. |
 | `hami.io/*-scheduler-policy: binpack` | Prefer packing workloads onto the same physical GPU. |
+| `--attention-backend=triton` | Uses the Triton attention backend verified on the H100 test cluster; choose a backend supported by your SGLang version and GPU architecture. |
 | `/dev/shm` Memory emptyDir | SGLang benefits from a larger shared-memory mount. |
 
 Wait for SGLang to become Ready (first start downloads the model and captures CUDA graphs):
@@ -487,7 +503,26 @@ memory.total [MiB], memory.used [MiB]
 81559 MiB, 18560 MiB
 ```
 
-That contrast — full card on the host, capped slice in the Pod — is the key evidence that HAMi memory virtualization is working for SGLang.
+That contrast confirms that HAMi's NVML interception exposes the configured quota. It is supporting evidence, but it does not by itself prove that an over-quota CUDA allocation is rejected.
+
+Verify CUDA-level enforcement by requesting a single 26 GiB allocation, which exceeds this Pod's 25,000 MiB quota:
+
+```bash
+kubectl exec -i -n sglang ${POD} -- python3 - <<'PY'
+import torch
+
+try:
+    torch.empty(26 * 1024**3 // 4, dtype=torch.float32, device="cuda")
+except RuntimeError as exc:
+    if "out of memory" not in str(exc).lower():
+        raise
+    print("PASS: over-quota CUDA allocation returned out of memory")
+else:
+    raise SystemExit("FAIL: over-quota CUDA allocation unexpectedly succeeded")
+PY
+```
+
+Expected output includes `PASS: over-quota CUDA allocation returned out of memory`. HAMi enforces the memory quota by intercepting CUDA allocation calls; this is software enforcement, not a hardware partition such as MIG. Compute limiting is likewise a software throttle.
 
 ## Troubleshooting
 
@@ -523,10 +558,20 @@ If this cluster is only used for this lab, you can also uninstall HAMi:
 helm uninstall hami -n kube-system
 ```
 
-Optional label cleanup:
+Restore the vendor device plugin after HAMi is removed. For the self-managed example above:
 
 ```bash
-kubectl label node <gpu-node-name> gpu-
+kubectl apply -f nvidia-device-plugin-backup.yaml
+```
+
+For a managed add-on or GPU Operator, reverse the vendor-specific change used to disable it and confirm exactly one device-plugin DaemonSet owns `nvidia.com/gpu`.
+
+Remove `gpu=on` only when this lab added it. Run this in the same shell that set `HAMI_LAB_ADDED_GPU_LABEL`:
+
+```bash
+if [ "${HAMI_LAB_ADDED_GPU_LABEL:-false}" = true ]; then
+  kubectl label node "${GPU_NODE}" gpu-
+fi
 ```
 
 ## Verification Results
@@ -536,12 +581,13 @@ kubectl label node <gpu-node-name> gpu-
 | HAMi has taken over GPU scheduling | SGLang Pod uses `schedulerName: hami-scheduler` and requests `nvidia.com/gpu`, `nvidia.com/gpumem`, `nvidia.com/gpucores`. |
 | GPU node runs HAMi device plugin | `hami-device-plugin` is Ready and advertises `nvidia.com/gpu=10`. |
 | SGLang runs on HAMi resources | Pod Ready; HAMi injects `CUDA_DEVICE_MEMORY_LIMIT_0=25000m` and `CUDA_DEVICE_SM_LIMIT=30`. |
-| Memory cap is visible in-container | In-pod `nvidia-smi` shows `... / 25000MiB` while host still shows `81559 MiB`. |
+| Memory quota is visible in-container | In-pod `nvidia-smi` shows `... / 25000MiB` while host still shows `81559 MiB`. |
+| Over-quota allocation is rejected | A 26 GiB PyTorch CUDA allocation returns an out-of-memory error under the 25,000 MiB quota. |
 | Inference service is accessible | `/v1/models` returns `Qwen/Qwen3-1.7B`; chat endpoint returns content. |
 
 ## Next Steps
 
 - Increase `replicas` and observe how HAMi packs multiple SGLang Pods with `binpack`.
 - Lower `nvidia.com/gpumem` / `nvidia.com/gpucores` further and co-locate another small workload on the same GPU.
-- Deliver the model from an OCI registry instead of Hugging Face: a companion **KitOps ModelKit** lab replaces the runtime download with a `kitops-init` initContainer ([website#561](https://github.com/Project-HAMi/website/issues/561)).
+- Deliver the model from an OCI registry instead of Hugging Face: the companion [KitOps ModelKit lab PR](https://github.com/Project-HAMi/website/pull/655) replaces the runtime download with a `kitops-init` initContainer.
 - For memory isolation and small-slice sharing patterns, see [Lab 3: GPU Partitioning](./gpu-partitioning).
