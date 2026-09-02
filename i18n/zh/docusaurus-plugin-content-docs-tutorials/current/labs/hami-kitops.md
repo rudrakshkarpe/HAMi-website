@@ -71,7 +71,7 @@ flowchart TB
 
 - 配备 NVIDIA GPU 的 Kubernetes 集群、正常运行的 HAMi，以及 `kubectl` 和 `helm`（完整设置请参阅[实验 6](./hami-vllm)）
 - Docker（或等效的构建工具），用于构建镜像并将其加载到集群
-- 工作站上的 [`kit`](https://github.com/jozu-ai/kitops) CLI（可选，但建议用于 `kit inspect`）
+- 工作站上的 [`kit`](https://github.com/kitops-ml/kitops) CLI（可选，但建议用于 `kit inspect`）
 - 能够从公共注册表 `jozu.ml` 拉取制品（示例 ModelKit 无需登录）
 
 本实验假设已经安装 HAMi。若尚未安装，请先完成[实验 6](./hami-vllm)的步骤 1 至 3。
@@ -143,11 +143,14 @@ ModelKit 将 safetensors 权重、分词器和配置作为 OCI 层保存。initC
 FROM alpine:3.20
 
 ARG KITOPS_VERSION=v1.11.0
+ARG TARGETARCH
 
 RUN apk add --no-cache bash coreutils findutils ca-certificates curl tar \
-    && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/kitops-linux-x86_64.tar.gz" -o /tmp/kit.tgz \
+    && case "${TARGETARCH}" in amd64) KITOPS_ARCH=x86_64 ;; arm64) KITOPS_ARCH=arm64 ;; *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; esac \
+    && KITOPS_ASSET="kitops-linux-${KITOPS_ARCH}.tar.gz" \
+    && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/${KITOPS_ASSET}" -o /tmp/kit.tgz \
     && curl -fsSL "https://github.com/kitops-ml/kitops/releases/download/${KITOPS_VERSION}/kitops_${KITOPS_VERSION}_checksums.txt" -o /tmp/kit-checksums.txt \
-    && grep "  kitops-linux-x86_64.tar.gz$" /tmp/kit-checksums.txt | sed 's#kitops-linux-x86_64.tar.gz#/tmp/kit.tgz#' | sha256sum -c - \
+    && grep "  ${KITOPS_ASSET}$" /tmp/kit-checksums.txt | sed "s#${KITOPS_ASSET}#/tmp/kit.tgz#" | sha256sum -c - \
     && tar -xzf /tmp/kit.tgz -C /usr/local/bin kit \
     && rm -f /tmp/kit.tgz /tmp/kit-checksums.txt \
     && kit version
@@ -172,7 +175,7 @@ ENTRYPOINT ["/usr/local/bin/unpack.sh"]
 #
 # Env (all overridable from the Pod spec):
 #   MODELKIT_REF   full ModelKit reference, e.g. jozu.ml/<org>/<repo>:<tag>
-#   UNPACK_PATH    root volume to unpack into                 (default /models)
+#   UNPACK_PATH    mounted model root, restricted to /models  (default /models)
 #   MODEL_SUBDIR   final model dir under UNPACK_PATH          (default qwen3)
 #   REGISTRY_URL/USERNAME/PASSWORD  optional creds for PRIVATE registries
 set -eu
@@ -180,11 +183,29 @@ set -eu
 MODELKIT_REF="${MODELKIT_REF:?MODELKIT_REF is required}"
 UNPACK_PATH="${UNPACK_PATH:-/models}"
 MODEL_SUBDIR="${MODEL_SUBDIR:-qwen3}"
+
+[ "${UNPACK_PATH}" = "/models" ] || {
+  echo "[kitunpacker] UNPACK_PATH must be /models" >&2
+  exit 1
+}
+case "${MODEL_SUBDIR}" in
+  "" | "." | ".." | */* | *[!A-Za-z0-9._-]*)
+    echo "[kitunpacker] MODEL_SUBDIR must be one safe path component" >&2
+    exit 1
+    ;;
+esac
+
+REF_KEY="$(printf '%s' "${MODELKIT_REF}" | sha256sum | cut -d ' ' -f 1)"
+RELEASES="${UNPACK_PATH}/.releases-${MODEL_SUBDIR}"
+PUBLISHED="${RELEASES}/${REF_KEY}"
 DEST="${UNPACK_PATH}/${MODEL_SUBDIR}"
 RAW="${UNPACK_PATH}/.raw-${MODEL_SUBDIR}"
-STAGE="${UNPACK_PATH}/.stage-${MODEL_SUBDIR}-$$"
+STAGE="${RELEASES}/.stage-${REF_KEY}-$$"
+LINK_TMP="${UNPACK_PATH}/.link-${MODEL_SUBDIR}-$$"
 LOCK="${UNPACK_PATH}/.lock-${MODEL_SUBDIR}"
 MARKER=".modelkit-ref"
+LOCK_OWNER="${HOSTNAME:-pod}-$$"
+STALE_LOCK_SECONDS=600
 
 # keep the kit pull cache on the (large) mounted volume, not the tiny rootfs
 export KITOPS_HOME="${UNPACK_PATH}/.kitcache"
@@ -208,22 +229,56 @@ fi
 
 # This lock only coordinates Pods when they mount the same shared PVC. With
 # the emptyDir used in this lab, every Pod has an isolated volume and lock.
-# mkdir is atomic, so Pods sharing a PVC do not race to write the same files.
-if ! mkdir "${LOCK}" 2>/dev/null; then
-  echo "[kitunpacker] another unpack in progress, waiting for it to finish..."
-  i=0
-  while [ "${i}" -lt 360 ]; do
-    ready && { echo "[kitunpacker] model became ready"; exit 0; }
-    i=$((i + 1)); sleep 5
-  done
-  echo "[kitunpacker] timed out waiting for peer unpack" >&2
-  exit 1
-fi
+# mkdir is atomic. A heartbeat allows recovery when a Pod is killed after
+# acquiring the lock, and each waiter retries acquisition after contention.
+acquire_lock() {
+  mkdir "${LOCK}" 2>/dev/null || return 1
+  printf '%s\n' "${LOCK_OWNER}" >"${LOCK}/owner"
+  touch "${LOCK}/heartbeat"
+}
+
+lock_is_stale() {
+  target="${LOCK}/heartbeat"
+  [ -e "${target}" ] || target="${LOCK}"
+  now="$(date +%s)"
+  modified="$(stat -c %Y "${target}" 2>/dev/null || echo "${now}")"
+  [ $((now - modified)) -gt "${STALE_LOCK_SECONDS}" ]
+}
+
+i=0
+until acquire_lock; do
+  ready && { echo "[kitunpacker] model became ready"; exit 0; }
+  if lock_is_stale; then
+    stale="${UNPACK_PATH}/.stale-lock-${MODEL_SUBDIR}-${LOCK_OWNER}"
+    if mv "${LOCK}" "${stale}" 2>/dev/null; then
+      echo "[kitunpacker] recovered stale lock"
+      rm -rf "${stale}"
+      continue
+    fi
+  fi
+  [ "${i}" -lt 360 ] || {
+    echo "[kitunpacker] timed out waiting for peer unpack" >&2
+    exit 1
+  }
+  i=$((i + 1))
+  sleep 5
+done
+
+heartbeat() {
+  while touch "${LOCK}/heartbeat" 2>/dev/null; do sleep 15; done
+}
+heartbeat &
+HEARTBEAT_PID=$!
+
 cleanup() {
   status=$?
   trap - EXIT
-  rm -rf "${RAW}" "${STAGE}" "${KITOPS_HOME}"
-  rmdir "${LOCK}" 2>/dev/null || true
+  kill "${HEARTBEAT_PID}" 2>/dev/null || true
+  wait "${HEARTBEAT_PID}" 2>/dev/null || true
+  rm -rf "${RAW}" "${STAGE}" "${LINK_TMP}" "${KITOPS_HOME}"
+  if [ "$(cat "${LOCK}/owner" 2>/dev/null || true)" = "${LOCK_OWNER}" ]; then
+    rm -rf "${LOCK}"
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
@@ -236,15 +291,21 @@ if [ -n "${REGISTRY_URL:-}" ] && [ -n "${USERNAME:-}" ] && [ -n "${PASSWORD:-}" 
   echo "${PASSWORD}" | kit login "${REGISTRY_URL}" -u "${USERNAME}" --password-stdin
 fi
 
-rm -rf "${RAW}" "${STAGE}"; mkdir -p "${RAW}" "${STAGE}"
+rm -rf "${RAW}" "${STAGE}"
+mkdir -p "${RAW}" "${STAGE}" "${RELEASES}"
 echo "[kitunpacker] pulling + unpacking model layers from registry..."
 kit unpack --filter model "${MODELKIT_REF}" -d "${RAW}"
 
 # Flatten: ModelKits may store the .safetensors shards in a model/ subdir while
 # config.json / *.index.json / tokenizer sit one level up. vLLM/transformers
 # need them all in one directory, so collect everything into a staging directory.
-SRC_CFG="$(find "${RAW}" -name config.json | head -1)"
-[ -n "${SRC_CFG}" ] || { echo "[kitunpacker] config.json not found after unpack" >&2; exit 1; }
+CONFIGS="$(find "${RAW}" -type f -name config.json -print)"
+CONFIG_COUNT="$(printf '%s\n' "${CONFIGS}" | sed '/^$/d' | wc -l | tr -d ' ')"
+[ "${CONFIG_COUNT}" -eq 1 ] || {
+  echo "[kitunpacker] expected exactly one config.json, found ${CONFIG_COUNT}" >&2
+  exit 1
+}
+SRC_CFG="${CONFIGS}"
 SRC="$(dirname "${SRC_CFG}")"
 
 # all weight shards, wherever they live under the unpacked tree
@@ -255,10 +316,17 @@ find "${SRC}" -maxdepth 1 -type f -exec mv -f {} "${STAGE}/" \;
 valid_model "${STAGE}" || { echo "[kitunpacker] validation failed: missing config or shards" >&2; exit 1; }
 printf '%s\n' "${MODELKIT_REF}" >"${STAGE}/${MARKER}"
 
-# Rename only a fully validated tree into place. Readers never observe a
-# partially populated DEST, and a stale DEST for another reference is replaced.
-rm -rf "${DEST}"
-mv "${STAGE}" "${DEST}"
+# Publish an immutable, validated release directory, then atomically switch the
+# destination symlink. Existing readers can keep using the previous directory.
+if [ ! -d "${PUBLISHED}" ]; then
+  mv "${STAGE}" "${PUBLISHED}"
+fi
+[ ! -e "${DEST}" ] || [ -L "${DEST}" ] || {
+  echo "[kitunpacker] refusing to replace non-symlink destination ${DEST}" >&2
+  exit 1
+}
+ln -s "${PUBLISHED}" "${LINK_TMP}"
+mv -Tf "${LINK_TMP}" "${DEST}"
 
 echo "[kitunpacker] final model directory:"
 ls -la "${DEST}"
@@ -447,6 +515,11 @@ spec:
               value: "/models"
             - name: MODEL_SUBDIR
               value: "qwen3"
+          resources:
+            requests:
+              ephemeral-storage: 20Gi
+            limits:
+              ephemeral-storage: 20Gi
           volumeMounts:
             - name: modelkit
               mountPath: /models
@@ -624,7 +697,7 @@ CUDA_DEVICE_SM_LIMIT=30
 
 ## 步骤 8（可选）：使用相同 ModelKit 模式共置 vLLM
 
-构建并加载 `hami-vllm-jozu:latest` 后，部署使用独立 HAMi 共享资源的第二个引擎。如果希望两个 Pod 复用同一个已解包的 ModelKit，请使用 **PVC**（或节点本地缓存）。使用 `emptyDir` 时，每个 Pod 都会独立解包。
+构建并加载 `hami-vllm-jozu:latest` 后，部署使用独立 HAMi 共享资源的第二个引擎。如果希望两个 Pod 复用同一个已解包的 ModelKit，请使用 **PVC**（或节点本地缓存）。使用 `emptyDir` 时，每个 Pod 都会独立解包。跨节点可靠共享需要支持 ReadWriteMany 的 StorageClass。kind 默认的 local-path provisioner 是节点本地存储，不能提供通用的跨节点共享 PVC。
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -660,6 +733,11 @@ spec:
               value: "/models"
             - name: MODEL_SUBDIR
               value: "qwen3"
+          resources:
+            requests:
+              ephemeral-storage: 20Gi
+            limits:
+              ephemeral-storage: 20Gi
           volumeMounts:
             - name: modelkit
               mountPath: /models
@@ -676,6 +754,12 @@ spec:
             - name: http
               containerPort: 8000
           resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+              nvidia.com/gpumem: "30000"
+              nvidia.com/gpucores: "30"
             limits:
               cpu: "8"
               memory: 32Gi
@@ -725,7 +809,7 @@ kubectl -n kitops port-forward svc/vllm-modelkit 8000:8000
 curl -s http://127.0.0.1:8000/v1/models
 ```
 
-确保合计的 `gpumem` 请求能够容纳在物理 GPU 上。例如，两个 30000 MiB 的请求需要该 GPU 至少有 60 GiB 可用显存。
+确保合计的 `gpumem` 请求能够容纳在物理 GPU 上。两个 30000 MiB 的请求需要该 GPU 有 60000 MiB（约 58.6 GiB）可用显存。
 
 ## 参考：Kitfile（重新打包自己的 ModelKit）
 
@@ -762,6 +846,7 @@ model:
 ```bash
 # After placing a safetensors-layout model directory at ./qwen3 next to the Kitfile:
 kit pack . -t jozu.ml/<your-org>/qwen3-4b-instruct:latest
+kit login jozu.ml
 kit push jozu.ml/<your-org>/qwen3-4b-instruct:latest
 ```
 
@@ -800,6 +885,6 @@ kubectl delete namespace kitops --ignore-not-found
 ## 后续步骤
 
 - 将公共 Jozu ModelKit 换成内部注册表中的 ModelKit，并配置 imagePullSecrets 或 `kit login` Secret。
-- 在 SGLang 和 vLLM 之间共享一个 PVC，使 ModelKit 只需解包一次。
+- 在 SGLang 和 vLLM 之间共享一个 ReadWriteMany PVC，使 ModelKit 在跨节点场景下只需解包一次。
 - 结合[实验 3：GPU 切分](./gpu-partitioning)，在每个 GPU 上容纳更多租户。
 - 若要采用更简单的调试路径，请先让 SGLang 在启动时直接拉取模型，再添加 ModelKit 供应链工作流。
