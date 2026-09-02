@@ -136,15 +136,13 @@ kubectl describe node | grep -A8 -E "Capacity:|Allocatable:" | grep -E "nvidia.c
 
 If the cluster already has a vendor NVIDIA device plugin installed, you may already see `nvidia.com/gpu`. HAMi's device plugin registers the same resource, so the two device plugins must not run on the same GPU nodes. Keep the NVIDIA drivers, Container Toolkit, and runtime installed, but disable or remove the vendor device-plugin DaemonSet before installing HAMi.
 
-First identify the existing plugin. On a self-managed cluster, record and remove it as follows, substituting the discovered namespace and DaemonSet name:
+First identify how the existing plugin was installed. You will need the original Helm release, Operator configuration, managed add-on setting, or source manifest to restore it later:
 
 ```bash
 kubectl get daemonsets --all-namespaces | grep -E 'nvidia.*device-plugin'
 
 VENDOR_PLUGIN_NAMESPACE=<namespace>
 VENDOR_PLUGIN_DAEMONSET=<daemonset-name>
-kubectl get daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
-  -n "${VENDOR_PLUGIN_NAMESPACE}" -o yaml >nvidia-device-plugin-backup.yaml
 kubectl delete daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
   -n "${VENDOR_PLUGIN_NAMESPACE}"
 ```
@@ -189,13 +187,10 @@ global:
     gpu: "on"
 
 devicePlugin:
+  # This is the chart default, shown explicitly because the lab verifies 10 shares.
   deviceSplitCount: 10
 
 scheduler:
-  # Match your cluster Kubernetes minor version (example: kind v1.36.1).
-  kubeScheduler:
-    image:
-      tag: "v1.36.1"
   leaderElect: false
 ```
 
@@ -204,8 +199,7 @@ Key configuration details:
 | Configuration | Description |
 | --- | --- |
 | `global.managedNodeSelector.gpu: "on"` | Only schedule the HAMi device plugin to GPU nodes labeled `gpu=on`. |
-| `devicePlugin.deviceSplitCount: 10` | Register each physical GPU as 10 vGPUs. |
-| `scheduler.kubeScheduler.image.tag` | Must match the cluster Kubernetes version. |
+| `devicePlugin.deviceSplitCount: 10` | Register each physical GPU as 10 vGPUs. This matches the current chart default and is explicit because the lab verifies the resulting value. |
 | `scheduler.leaderElect: false` | Single-replica lab scheduler; avoids extender leader-election waits. |
 
 Install HAMi:
@@ -505,7 +499,7 @@ memory.total [MiB], memory.used [MiB]
 
 That contrast confirms that HAMi's NVML interception exposes the configured quota. It is supporting evidence, but it does not by itself prove that an over-quota CUDA allocation is rejected.
 
-Verify CUDA-level enforcement by requesting a single 26 GiB allocation, which exceeds this Pod's 25,000 MiB quota:
+Optionally verify CUDA-level enforcement by requesting a single 26 GiB allocation from a separate process. The request exceeds this Pod's entire 25,000 MiB quota, so it should fail without retaining memory or changing the serving process:
 
 ```bash
 kubectl exec -i -n sglang ${POD} -- python3 - <<'PY'
@@ -522,7 +516,14 @@ else:
 PY
 ```
 
-Expected output includes `PASS: over-quota CUDA allocation returned out of memory`. HAMi enforces the memory quota by intercepting CUDA allocation calls; this is software enforcement, not a hardware partition such as MIG. Compute limiting is likewise a software throttle.
+Expected output includes `PASS: over-quota CUDA allocation returned out of memory`. Confirm that the live server remains healthy after the failed allocation:
+
+```bash
+curl --fail --silent http://127.0.0.1:8001/health
+curl --fail --silent http://127.0.0.1:8001/v1/models | python3 -m json.tool
+```
+
+HAMi enforces the memory quota by intercepting CUDA allocation calls; this is software enforcement, not a hardware partition such as MIG. Compute limiting is likewise a software throttle.
 
 ## Troubleshooting
 
@@ -558,13 +559,13 @@ If this cluster is only used for this lab, you can also uninstall HAMi:
 helm uninstall hami -n kube-system
 ```
 
-Restore the vendor device plugin after HAMi is removed. For the self-managed example above:
+Restore the vendor device plugin after HAMi is removed by reversing the method used to disable it. For a self-managed plugin installed from a manifest, apply the original version-pinned source manifest, not a live `kubectl get -o yaml` export:
 
 ```bash
-kubectl apply -f nvidia-device-plugin-backup.yaml
+kubectl apply -f <original-version-pinned-device-plugin-manifest>
 ```
 
-For a managed add-on or GPU Operator, reverse the vendor-specific change used to disable it and confirm exactly one device-plugin DaemonSet owns `nvidia.com/gpu`.
+For a Helm release, GPU Operator, or managed add-on, restore it through that same management mechanism. Confirm that exactly one device-plugin DaemonSet owns `nvidia.com/gpu`.
 
 Remove `gpu=on` only when this lab added it. Run this in the same shell that set `HAMI_LAB_ADDED_GPU_LABEL`:
 

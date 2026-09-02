@@ -76,7 +76,22 @@ flowchart TB
 
 ```bash
 kubectl get nodes -o wide
+```
+
+```plaintext
+NAME                      STATUS   ROLES           AGE   VERSION   INTERNAL-IP   OS-IMAGE                       CONTAINER-RUNTIME
+hami-demo-control-plane   Ready    control-plane   2m    v1.36.1   172.19.0.2    Debian GNU/Linux 13 (trixie)   containerd://2.3.1
+```
+
+主机 GPU：
+
+```bash
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
+```
+
+```plaintext
+index, name, memory.total [MiB]
+0, NVIDIA H100 80GB HBM3, 81559 MiB
 ```
 
 安装 HAMi 后，每张物理 GPU 被注册为 10 个可调度共享资源：
@@ -84,6 +99,17 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv
 ```bash
 kubectl get nodes -o 'custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'
 kubectl get pods -n kube-system -l app.kubernetes.io/instance=hami -o wide
+```
+
+```plaintext
+NAME                      GPU
+hami-demo-control-plane   10
+```
+
+```plaintext
+NAME                              READY   STATUS    NODE
+hami-device-plugin-...            2/2     Running   hami-demo-control-plane
+hami-scheduler-...                2/2     Running   hami-demo-control-plane
 ```
 
 ## 步骤 1：检查 GPU 集群
@@ -95,15 +121,13 @@ kubectl describe node | grep -A8 -E "Capacity:|Allocatable:" | grep -E "nvidia.c
 
 HAMi 和厂商 NVIDIA 设备插件会注册相同的 `nvidia.com/gpu` 资源，因此二者不能同时运行在同一 GPU 节点。保留 NVIDIA 驱动、Container Toolkit 和运行时，但在安装 HAMi 前禁用或移除厂商设备插件。
 
-在自管理集群中，先找到、备份并移除现有 DaemonSet：
+先确认现有插件的安装方式。稍后需要使用原始 Helm release、Operator 配置、托管插件设置或源清单来恢复它：
 
 ```bash
 kubectl get daemonsets --all-namespaces | grep -E 'nvidia.*device-plugin'
 
 VENDOR_PLUGIN_NAMESPACE=<namespace>
 VENDOR_PLUGIN_DAEMONSET=<daemonset-name>
-kubectl get daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
-  -n "${VENDOR_PLUGIN_NAMESPACE}" -o yaml >nvidia-device-plugin-backup.yaml
 kubectl delete daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
   -n "${VENDOR_PLUGIN_NAMESPACE}"
 ```
@@ -137,22 +161,18 @@ global:
     gpu: "on"
 
 devicePlugin:
+  # 这是 chart 的默认值。此处显式展示，因为实验会验证 10 个共享资源。
   deviceSplitCount: 10
 
 scheduler:
-  # 与集群 Kubernetes 版本一致；示例为 kind v1.36.1。
-  kubeScheduler:
-    image:
-      tag: "v1.36.1"
   leaderElect: false
 ```
 
-| 配置                                   | 说明                                             |
-| -------------------------------------- | ------------------------------------------------ |
+| 配置 | 说明 |
+| --- | --- |
 | `global.managedNodeSelector.gpu: "on"` | 仅在带 `gpu=on` 标签的节点上运行 HAMi 设备插件。 |
-| `devicePlugin.deviceSplitCount: 10`    | 将每张物理 GPU 注册为 10 个 vGPU。               |
-| `scheduler.kubeScheduler.image.tag`    | 必须与集群 Kubernetes 版本一致。                 |
-| `scheduler.leaderElect: false`         | 本实验使用单副本调度器。                         |
+| `devicePlugin.deviceSplitCount: 10` | 将每张物理 GPU 注册为 10 个 vGPU。该值与当前 chart 默认值一致，并因实验会验证结果而显式设置。 |
+| `scheduler.leaderElect: false` | 本实验使用单副本调度器。 |
 
 ```bash
 helm upgrade --install hami hami-charts/hami \
@@ -291,7 +311,7 @@ kubectl -n sglang port-forward svc/sglang-qwen3-17b 8001:8001
 ## 步骤 6：测试推理
 
 ```bash
-curl -s http://127.0.0.1:8001/v1/models | jq
+curl -s http://127.0.0.1:8001/v1/models | python3 -m json.tool
 
 curl -s http://127.0.0.1:8001/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -301,7 +321,7 @@ curl -s http://127.0.0.1:8001/v1/chat/completions \
     "temperature": 0.2,
     "max_tokens": 80,
     "chat_template_kwargs": {"enable_thinking": false}
-  }' | jq
+  }' | python3 -m json.tool
 ```
 
 若响应包含 `choices[0].message.content`，说明 SGLang 推理服务正常工作。
@@ -316,9 +336,35 @@ kubectl exec -n sglang ${POD} -- env | grep -E 'CUDA_DEVICE|NVIDIA_VISIBLE'
 kubectl exec -n sglang ${POD} -- nvidia-smi
 ```
 
+HAMi 注入的环境变量示例：
+
+```plaintext
+NVIDIA_VISIBLE_DEVICES=GPU-04b76a6c-da10-342f-e9f5-5f5684eacb86
+CUDA_DEVICE_MEMORY_LIMIT_0=25000m
+CUDA_DEVICE_SM_LIMIT=30
+```
+
+Pod 内的预期显存视图：
+
+```plaintext
+| GPU  Name                 ... | Memory-Usage          |
+| NVIDIA H100 80GB HBM3     ... | 18213MiB / 25000MiB   |
+```
+
+主机仍显示完整物理容量：
+
+```bash
+nvidia-smi --query-gpu=memory.total,memory.used --format=csv
+```
+
+```plaintext
+memory.total [MiB], memory.used [MiB]
+81559 MiB, 18560 MiB
+```
+
 容器内 `nvidia-smi` 应显示接近 25,000 MiB 的总显存，而主机仍显示物理卡完整容量。这证明 HAMi 的 NVML 拦截公开了所配置的配额，但还不能单独证明超额 CUDA 分配会失败。
 
-请求一次 26 GiB 分配，以验证 CUDA 层的配额实施：
+可以选择从单独进程请求一次 26 GiB 分配，以验证 CUDA 层的配额实施。该请求超过 Pod 的完整 25,000 MiB 配额，因此应失败，并且不会保留显存或改变服务进程：
 
 ```bash
 kubectl exec -i -n sglang ${POD} -- python3 - <<'PY'
@@ -335,7 +381,14 @@ else:
 PY
 ```
 
-预期输出包含 `PASS`。HAMi 通过拦截 CUDA 分配调用实施软件显存配额，这不同于 MIG 等硬件分区；算力限制同样属于软件节流。
+预期输出包含 `PASS`。随后确认实时服务仍然健康：
+
+```bash
+curl --fail --silent http://127.0.0.1:8001/health
+curl --fail --silent http://127.0.0.1:8001/v1/models | python3 -m json.tool
+```
+
+HAMi 通过拦截 CUDA 分配调用实施软件显存配额，这不同于 MIG 等硬件分区；算力限制同样属于软件节流。
 
 ## 故障排除
 
@@ -361,13 +414,13 @@ kubectl delete namespace sglang --ignore-not-found
 helm uninstall hami -n kube-system
 ```
 
-卸载 HAMi 后恢复厂商设备插件。对于上述自管理示例：
+卸载 HAMi 后，使用之前禁用插件时对应的方法恢复厂商设备插件。对于通过清单安装的自管理插件，请应用原始的固定版本源清单，不要使用实时 `kubectl get -o yaml` 导出：
 
 ```bash
-kubectl apply -f nvidia-device-plugin-backup.yaml
+kubectl apply -f <original-version-pinned-device-plugin-manifest>
 ```
 
-对于托管插件或 GPU Operator，请撤销之前的厂商专用禁用操作，并确认只有一个设备插件 DaemonSet 管理 `nvidia.com/gpu`。
+对于 Helm release、GPU Operator 或托管插件，请通过相同的管理机制恢复它，并确认只有一个设备插件 DaemonSet 管理 `nvidia.com/gpu`。
 
 仅当本实验添加了 `gpu=on` 时才移除该标签；请在设置变量的同一 shell 中执行：
 
