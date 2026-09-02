@@ -138,10 +138,8 @@ kubectl delete daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
 
 ```bash
 GPU_NODE=<gpu-node-name>
+GPU_LABEL_WAS_PRESENT="$(kubectl get node "${GPU_NODE}" -o go-template='{{if hasKey .metadata.labels "gpu"}}true{{else}}false{{end}}')"
 GPU_LABEL_BEFORE="$(kubectl get node "${GPU_NODE}" -o jsonpath='{.metadata.labels.gpu}')"
-if [ "${GPU_LABEL_BEFORE}" != "on" ]; then
-  export HAMI_LAB_ADDED_GPU_LABEL=true
-fi
 kubectl label node "${GPU_NODE}" gpu=on --overwrite
 ```
 
@@ -179,7 +177,15 @@ helm upgrade --install hami hami-charts/hami \
   -n kube-system \
   -f hami-values.yaml \
   --version 2.9.0
+```
 
+> 在部分 ACK Kubernetes 1.36 集群中，如果调度器日志显示 `resource.k8s.io` 权限错误，请应用实验 6 使用的 DRA RBAC 辅助清单：
+>
+> ```bash
+> kubectl apply -f https://raw.githubusercontent.com/Project-HAMi/website/master/tutorials/labs/hami-vllm/hami-scheduler-dra-rbac.yaml
+> ```
+
+```bash
 kubectl rollout status deployment/hami-scheduler -n kube-system
 kubectl rollout status daemonset/hami-device-plugin -n kube-system
 ```
@@ -364,14 +370,19 @@ memory.total [MiB], memory.used [MiB]
 
 容器内 `nvidia-smi` 应显示接近 25,000 MiB 的总显存，而主机仍显示物理卡完整容量。这证明 HAMi 的 NVML 拦截公开了所配置的配额，但还不能单独证明超额 CUDA 分配会失败。
 
-可以选择从单独进程请求一次 26 GiB 分配，以验证 CUDA 层的配额实施。该请求超过 Pod 的完整 25,000 MiB 配额，因此应失败，并且不会保留显存或改变服务进程：
+可以选择从单独进程验证 CUDA 层的配额实施。将 `GPU_QUOTA_MIB` 设置为清单中的 `nvidia.com/gpumem` 值。探针会请求比该配额多 1024 MiB，因此降低其他 GPU 的配额后仍然适用：
 
 ```bash
-kubectl exec -i -n sglang ${POD} -- python3 - <<'PY'
+GPU_QUOTA_MIB=25000
+OVER_QUOTA_MIB=$((GPU_QUOTA_MIB + 1024))
+kubectl exec -i -n sglang ${POD} -- \
+  env OVER_QUOTA_MIB="${OVER_QUOTA_MIB}" python3 - <<'PY'
+import os
 import torch
 
+allocation_mib = int(os.environ["OVER_QUOTA_MIB"])
 try:
-    torch.empty(26 * 1024**3 // 4, dtype=torch.float32, device="cuda")
+    torch.empty(allocation_mib * 1024**2 // 4, dtype=torch.float32, device="cuda")
 except RuntimeError as exc:
     if "out of memory" not in str(exc).lower():
         raise
@@ -381,7 +392,7 @@ else:
 PY
 ```
 
-预期输出包含 `PASS`。随后确认实时服务仍然健康：
+预期输出包含 `PASS`。失败的请求不应保留显存或改变服务进程。随后确认实时服务仍然健康：
 
 ```bash
 curl --fail --silent http://127.0.0.1:8001/health
@@ -422,23 +433,25 @@ kubectl apply -f <original-version-pinned-device-plugin-manifest>
 
 对于 Helm release、GPU Operator 或托管插件，请通过相同的管理机制恢复它，并确认只有一个设备插件 DaemonSet 管理 `nvidia.com/gpu`。
 
-仅当本实验添加了 `gpu=on` 时才移除该标签；请在设置变量的同一 shell 中执行：
+恢复原始 `gpu` 标签状态。请在记录 `GPU_LABEL_WAS_PRESENT` 和 `GPU_LABEL_BEFORE` 的同一 shell 中执行：
 
 ```bash
-if [ "${HAMI_LAB_ADDED_GPU_LABEL:-false}" = true ]; then
+if [ "${GPU_LABEL_WAS_PRESENT}" = true ]; then
+  kubectl label node "${GPU_NODE}" "gpu=${GPU_LABEL_BEFORE}" --overwrite
+else
   kubectl label node "${GPU_NODE}" gpu-
 fi
 ```
 
 ## 验证结果
 
-| 声明                      | 证据                                                   |
-| ------------------------- | ------------------------------------------------------ |
-| HAMi 接管 GPU 调度        | Pod 使用 `hami-scheduler` 并请求 HAMi GPU 资源。       |
-| SGLang 在 HAMi 资源上运行 | Pod Ready，HAMi 注入显存和 SM 限制变量。               |
-| 容器内可见显存配额        | Pod 内显示 25,000 MiB，而主机显示完整物理容量。        |
-| 超额分配被拒绝            | 26 GiB PyTorch CUDA 分配在 25,000 MiB 配额下返回 OOM。 |
-| 推理服务可访问            | 模型列表和聊天接口均正常返回。                         |
+| 声明                      | 证据                                                     |
+| ------------------------- | -------------------------------------------------------- |
+| HAMi 接管 GPU 调度        | Pod 使用 `hami-scheduler` 并请求 HAMi GPU 资源。         |
+| SGLang 在 HAMi 资源上运行 | Pod Ready，HAMi 注入显存和 SM 限制变量。                 |
+| 容器内可见显存配额        | Pod 内显示 25,000 MiB，而主机显示完整物理容量。          |
+| 超额分配被拒绝            | PyTorch CUDA 分配请求比配置配额高 1024 MiB，并返回 OOM。 |
+| 推理服务可访问            | 模型列表和聊天接口均正常返回。                           |
 
 ## 后续步骤
 

@@ -153,20 +153,9 @@ HAMi's device plugin matches `gpu=on` when managed node selectors are enabled. R
 
 ```bash
 GPU_NODE=<gpu-node-name>
+GPU_LABEL_WAS_PRESENT="$(kubectl get node "${GPU_NODE}" -o go-template='{{if hasKey .metadata.labels "gpu"}}true{{else}}false{{end}}')"
 GPU_LABEL_BEFORE="$(kubectl get node "${GPU_NODE}" -o jsonpath='{.metadata.labels.gpu}')"
-if [ "${GPU_LABEL_BEFORE}" != "on" ]; then
-  export HAMI_LAB_ADDED_GPU_LABEL=true
-fi
 kubectl label node "${GPU_NODE}" gpu=on --overwrite
-```
-
-On Alibaba Cloud ACK, you can also select by vendor labels, for example:
-
-```bash
-kubectl label nodes \
-  -l aliyun.accelerator/xpu_type=nvidia \
-  gpu=on \
-  --overwrite
 ```
 
 ## Step 2: Install HAMi
@@ -211,7 +200,11 @@ helm upgrade --install hami hami-charts/hami \
   --version 2.9.0
 ```
 
-> On some ACK Kubernetes 1.36 clusters, the built-in kube-scheduler in HAMi also needs DRA-related RBAC. If the scheduler logs show `resource.k8s.io` permission errors, apply the same DRA RBAC helper used in [Lab 6](./hami-vllm).
+> On some ACK Kubernetes 1.36 clusters, the built-in kube-scheduler in HAMi also needs DRA-related RBAC. If the scheduler logs show `resource.k8s.io` permission errors, apply the helper used in [Lab 6](./hami-vllm):
+>
+> ```bash
+> kubectl apply -f https://raw.githubusercontent.com/Project-HAMi/website/master/tutorials/labs/hami-vllm/hami-scheduler-dra-rbac.yaml
+> ```
 
 Wait for components to be running:
 
@@ -499,14 +492,19 @@ memory.total [MiB], memory.used [MiB]
 
 That contrast confirms that HAMi's NVML interception exposes the configured quota. It is supporting evidence, but it does not by itself prove that an over-quota CUDA allocation is rejected.
 
-Optionally verify CUDA-level enforcement by requesting a single 26 GiB allocation from a separate process. The request exceeds this Pod's entire 25,000 MiB quota, so it should fail without retaining memory or changing the serving process:
+Optionally verify CUDA-level enforcement from a separate process. Set `GPU_QUOTA_MIB` to the `nvidia.com/gpumem` value used in your manifest. The probe requests 1024 MiB more than that quota, so it remains valid if you lower the quota for another GPU:
 
 ```bash
-kubectl exec -i -n sglang ${POD} -- python3 - <<'PY'
+GPU_QUOTA_MIB=25000
+OVER_QUOTA_MIB=$((GPU_QUOTA_MIB + 1024))
+kubectl exec -i -n sglang ${POD} -- \
+  env OVER_QUOTA_MIB="${OVER_QUOTA_MIB}" python3 - <<'PY'
+import os
 import torch
 
+allocation_mib = int(os.environ["OVER_QUOTA_MIB"])
 try:
-    torch.empty(26 * 1024**3 // 4, dtype=torch.float32, device="cuda")
+    torch.empty(allocation_mib * 1024**2 // 4, dtype=torch.float32, device="cuda")
 except RuntimeError as exc:
     if "out of memory" not in str(exc).lower():
         raise
@@ -516,7 +514,7 @@ else:
 PY
 ```
 
-Expected output includes `PASS: over-quota CUDA allocation returned out of memory`. Confirm that the live server remains healthy after the failed allocation:
+Expected output includes `PASS: over-quota CUDA allocation returned out of memory`. The failed request should not retain memory or change the serving process. Confirm that the live server remains healthy:
 
 ```bash
 curl --fail --silent http://127.0.0.1:8001/health
@@ -567,10 +565,12 @@ kubectl apply -f <original-version-pinned-device-plugin-manifest>
 
 For a Helm release, GPU Operator, or managed add-on, restore it through that same management mechanism. Confirm that exactly one device-plugin DaemonSet owns `nvidia.com/gpu`.
 
-Remove `gpu=on` only when this lab added it. Run this in the same shell that set `HAMI_LAB_ADDED_GPU_LABEL`:
+Restore the original `gpu` label state. Run this in the same shell that recorded `GPU_LABEL_WAS_PRESENT` and `GPU_LABEL_BEFORE`:
 
 ```bash
-if [ "${HAMI_LAB_ADDED_GPU_LABEL:-false}" = true ]; then
+if [ "${GPU_LABEL_WAS_PRESENT}" = true ]; then
+  kubectl label node "${GPU_NODE}" "gpu=${GPU_LABEL_BEFORE}" --overwrite
+else
   kubectl label node "${GPU_NODE}" gpu-
 fi
 ```
@@ -583,7 +583,7 @@ fi
 | GPU node runs HAMi device plugin | `hami-device-plugin` is Ready and advertises `nvidia.com/gpu=10`. |
 | SGLang runs on HAMi resources | Pod Ready; HAMi injects `CUDA_DEVICE_MEMORY_LIMIT_0=25000m` and `CUDA_DEVICE_SM_LIMIT=30`. |
 | Memory quota is visible in-container | In-pod `nvidia-smi` shows `... / 25000MiB` while host still shows `81559 MiB`. |
-| Over-quota allocation is rejected | A 26 GiB PyTorch CUDA allocation returns an out-of-memory error under the 25,000 MiB quota. |
+| Over-quota allocation is rejected | A PyTorch CUDA allocation 1024 MiB above the configured quota returns an out-of-memory error. |
 | Inference service is accessible | `/v1/models` returns `Qwen/Qwen3-1.7B`; chat endpoint returns content. |
 
 ## Next Steps
