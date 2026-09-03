@@ -140,8 +140,14 @@ kubectl delete daemonset "${VENDOR_PLUGIN_DAEMONSET}" \
 
 ```bash
 GPU_NODE=<gpu-node-name>
-GPU_LABEL_WAS_PRESENT="$(kubectl get node "${GPU_NODE}" -o go-template='{{if hasKey .metadata.labels "gpu"}}true{{else}}false{{end}}')"
-GPU_LABEL_BEFORE="$(kubectl get node "${GPU_NODE}" -o jsonpath='{.metadata.labels.gpu}')"
+GPU_LABEL_WAS_PRESENT="$(kubectl get node "${GPU_NODE}" -o go-template='{{if .metadata.labels}}{{if index .metadata.labels "gpu"}}true{{else}}false{{end}}{{else}}false{{end}}')" || {
+  echo "无法记录 gpu 标签是否存在" >&2
+  exit 1
+}
+GPU_LABEL_BEFORE="$(kubectl get node "${GPU_NODE}" -o jsonpath='{.metadata.labels.gpu}')" || {
+  echo "无法记录当前的 gpu 标签" >&2
+  exit 1
+}
 kubectl label node "${GPU_NODE}" gpu=on --overwrite
 ```
 
@@ -184,7 +190,13 @@ helm upgrade --install hami hami-charts/hami \
 > 在部分 ACK Kubernetes 1.36 集群中，如果调度器日志显示 `resource.k8s.io` 权限错误，请应用实验 6 使用的 DRA RBAC 辅助清单：
 >
 > ```bash
-> kubectl apply -f https://raw.githubusercontent.com/Project-HAMi/website/master/tutorials/labs/hami-vllm/hami-scheduler-dra-rbac.yaml
+> RBAC_COMMIT="90ac82510bfabe05894dd8037078c59f02a51553"
+> RBAC_SHA256="e0a77f99422230ccc8958aac0d04694347769279ec26a9d4a5ff729f89efe3d9"
+> RBAC_MANIFEST="hami-scheduler-dra-rbac.yaml"
+> curl -fsSLo "${RBAC_MANIFEST}" \
+>   "https://raw.githubusercontent.com/Project-HAMi/website/${RBAC_COMMIT}/tutorials/labs/hami-vllm/hami-scheduler-dra-rbac.yaml"
+> printf '%s  %s\n' "${RBAC_SHA256}" "${RBAC_MANIFEST}" | sha256sum -c -
+> kubectl apply -f "${RBAC_MANIFEST}"
 > ```
 
 ```bash
