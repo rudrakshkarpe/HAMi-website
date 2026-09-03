@@ -32,6 +32,7 @@ toc_max_heading_level: 2
 ## 实验概览
 
 ```mermaid
+%% title: HAMi + SGLang 实验流程图
 flowchart LR
     Step1["步骤 1<br/>检查 GPU 集群"] --> Step2["步骤 2<br/>安装 HAMi"]
     Step2 --> Step3["步骤 3<br/>验证 HAMi 资源"]
@@ -45,6 +46,7 @@ flowchart LR
 ## 部署架构
 
 ```mermaid
+%% title: HAMi + SGLang 部署架构
 flowchart TB
     Client["客户端<br/>curl / OpenAI SDK"] --> PF["端口转发 / LoadBalancer"]
     PF --> SVC["SGLang Service<br/>端口 8001"]
